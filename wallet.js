@@ -167,6 +167,16 @@ export class BtcWallet {
     })
   }
 
+  /** Largest amount send() can deliver right now (all UTXOs, minus fee). */
+  async maxSendable({ feeRate } = {}) {
+    const rate = feeRate ?? await this.feeRate()
+    const utxos = await this.utxos()
+    if (!utxos.length) return 0
+    const inVb = this.taproot ? 57.5 : 68
+    const fee = Math.ceil(10.5 + inVb * utxos.length + 31 * 2) * rate
+    return Math.max(0, utxos.reduce((sum, u) => sum + u.value, 0) - fee)
+  }
+
   async feeRate() {
     try {
       const fees = await (await this._api('/v1/fees/recommended')).json()
@@ -248,6 +258,19 @@ export async function tipWallet(network = preferredNetwork()) {
   return cache.wallet
 }
 
+/** BTC spot price (Coinbase), cached 5 min. Returns null offline. */
+let _usd = null, _usdAt = 0
+export async function btcUsd() {
+  if (_usd && Date.now() - _usdAt < 300_000) return _usd
+  try {
+    const res = await fetch('https://api.coinbase.com/v2/prices/BTC-USD/spot')
+    _usd = Number((await res.json()).data.amount)
+    _usdAt = Date.now()
+  } catch {}
+  return _usd
+}
+export const satsToUsd = (sats, price) => price ? (sats / 1e8) * price : null
+
 export const formatSats = (sats) =>
   sats >= 100_000_000 ? (sats / 100_000_000).toFixed(4) + ' BTC' : sats.toLocaleString() + ' sats'
 
@@ -274,7 +297,7 @@ const WALLET_TEMPLATE = /* html */ `
   .addr:hover { outline: 1px solid #f7931a; }
   canvas { width: 9rem; image-rendering: pixelated; border: 1px solid var(--nc-line, #e9e6e0);
     border-radius: 8px; justify-self: center; }
-  form { display: grid; gap: .5rem; grid-template-columns: 1fr auto; }
+  form { display: grid; gap: .5rem; grid-template-columns: 1fr auto auto; }
   input { font: inherit; font-size: .82rem; font-family: var(--nc-mono, ui-monospace, monospace);
     padding: .5em .7em; border-radius: 8px; border: 1px solid var(--nc-line, #e9e6e0);
     background: var(--nc-inset, #f4f2ee); color: inherit; min-width: 0; }
@@ -373,7 +396,16 @@ class NostrWallet extends HTMLElement {
     amount.name = 'sats'; amount.placeholder = 'sats'; amount.inputMode = 'numeric'
     const send = document.createElement('button')
     send.textContent = 'Send'
-    form.append(to, amount, send)
+    const maxBtn = document.createElement('button')
+    maxBtn.type = 'button'
+    maxBtn.className = 'ghost'
+    maxBtn.textContent = 'Max'
+    maxBtn.onclick = async () => {
+      maxBtn.disabled = true
+      try { amount.value = String(await w.maxSendable()) } catch {}
+      maxBtn.disabled = false
+    }
+    form.append(to, amount, maxBtn, send)
 
     this.status = document.createElement('div')
     this.status.className = 'status'
@@ -447,7 +479,12 @@ class NostrWallet extends HTMLElement {
       this.balanceEl.innerHTML = ''
       this.balanceEl.append(formatSats(total))
       const small = document.createElement('small')
-      small.textContent = mempool ? ` (${mempool > 0 ? '+' : ''}${mempool} unconfirmed)` : ''
+      const price = await btcUsd()
+      const usd = satsToUsd(total, price)
+      const bits = []
+      if (usd !== null && total > 0) bits.push('\u2248 $' + usd.toFixed(usd < 10 ? 2 : 0) + (this.wallet.networkName === 'mainnet' ? '' : ' at mainnet price'))
+      if (mempool) bits.push(`${mempool > 0 ? '+' : ''}${mempool} unconfirmed`)
+      small.textContent = bits.length ? ' (' + bits.join(' \u00b7 ') + ')' : ''
       this.balanceEl.append(small)
       this.dispatchEvent(new CustomEvent('nostr:wallet-balance', { detail: { total }, bubbles: true, composed: true }))
       const history = await this.wallet.history(6)
@@ -516,6 +553,17 @@ class BtcTipButton extends HTMLElement {
       b.onclick = () => this._tip(sats)
       presets.append(b)
     }
+    btcUsd().then((price) => {
+      if (!price) return
+      let i = 0
+      for (const b of presets.children) {
+        const usd = satsToUsd(PRESETS[i++], price)
+        const sub = document.createElement('div')
+        sub.style.cssText = 'font-size:.62rem;font-weight:400;color:var(--nc-faint,#a8a4b0)'
+        sub.textContent = '\u2248$' + (usd < 1 ? usd.toFixed(2) : usd.toFixed(usd < 10 ? 2 : 0))
+        b.append(sub)
+      }
+    })
     this.$('btn').onclick = () => this._open()
     document.addEventListener('click', this._outside)
   }
