@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='46' fill='%23f7931a'/><text x='28' y='74' font-size='64' fill='white' font-family='sans-serif' font-weight='bold'>₿</text></svg>">
+<meta property="og:title" content="wallet — nostr-client">
+<meta property="og:description" content="An in-browser bitcoin wallet for nostr tipping. Testnet-first, no build.">
+<meta property="og:url" content="https://nostr-client.github.io/wallet/">
+<meta property="og:image" content="https://nostr-client.github.io/wallet/og.png">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<title>wallet — in-browser bitcoin tip wallet</title>
+<link rel="stylesheet" href="https://nostr-client.github.io/theme/theme.css">
+<style>
+  body { max-width: 42rem; margin: 2.5rem auto; padding: 0 1.2rem 4rem; }
+  h1 { font-size: 1.4rem; } h1 a { text-decoration: none; }
+  header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+  .cols { display: grid; gap: 1.4rem; }
+  h2 { font-size: .95rem; color: var(--nc-soft); }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="https://github.com/nostr-client/wallet">nostr-client / wallet</a></h1>
+  <nostr-login></nostr-login>
+</header>
+<p class="nc-muted">A real bitcoin wallet in your tab — <strong>testnet</strong>,
+keys in localStorage, transactions signed in the browser, broadcast via
+mempool.space. Log in, grab sats from a faucet, and tip any note below
+instantly:</p>
+<div class="cols">
+  <nostr-wallet></nostr-wallet>
+  <div><h2>Live notes — hover ₿ tip</h2><nostr-feed limit="6"></nostr-feed></div>
+</div>
+<script type="module">
+  import 'https://nostr-client.github.io/login/login.js'
+  import './wallet.js'
+  import 'https://nostr-client.github.io/feed/feed.js'
+</script>
+</body>
+</html>
