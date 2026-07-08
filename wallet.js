@@ -482,6 +482,7 @@ class NostrWallet extends HTMLElement {
       const price = await btcUsd()
       const usd = satsToUsd(total, price)
       const bits = []
+      if (total === 0 && this.wallet.net.faucets.length) bits.push('empty — grab free sats from a faucet below')
       if (usd !== null && total > 0) bits.push('\u2248 $' + usd.toFixed(usd < 10 ? 2 : 0) + (this.wallet.networkName === 'mainnet' ? '' : ' at mainnet price'))
       if (mempool) bits.push(`${mempool > 0 ? '+' : ''}${mempool} unconfirmed`)
       small.textContent = bits.length ? ' (' + bits.join(' \u00b7 ') + ')' : ''
