@@ -363,7 +363,7 @@ class NostrWallet extends HTMLElement {
     title.textContent = '₿ tip wallet'
     const net = document.createElement('span')
     net.className = 'net' + (w.networkName === 'mainnet' ? ' mainnet' : '')
-    net.textContent = w.networkName
+    net.textContent = w.networkName === 'testnet' ? 'testnet3' : w.networkName
     head.append(title, net)
 
     this.balanceEl = document.createElement('div')
