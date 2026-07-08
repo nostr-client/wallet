@@ -28,6 +28,16 @@ const CURVES_URL = 'https://esm.sh/@noble/curves@1.6.0/secp256k1'
 const UQR_URL = 'https://esm.sh/uqr@0.1.2'
 
 export const NETWORKS = {
+  testnet4: {
+    api: 'https://mempool.space/testnet4/api',
+    explorer: 'https://mempool.space/testnet4',
+    unit: 'tsat', coin: 'tBTC',
+    profileField: 'btc_test',
+    faucets: [
+      'https://coinfaucet.eu/en/btc-testnet4/',
+      'https://faucet.testnet4.dev/',
+    ],
+  },
   testnet: {
     api: 'https://mempool.space/testnet/api',
     explorer: 'https://mempool.space/testnet',
@@ -49,6 +59,17 @@ export const NETWORKS = {
 }
 
 const storageKey = (network, scope) => `nostr-client:btc-wallet:${network}:${scope}`
+const NET_PREF_KEY = 'nostr-client:btc-network'
+
+/** The user's chosen network (Settings). Default: testnet4. */
+export function preferredNetwork() {
+  const saved = localStorage.getItem(NET_PREF_KEY)
+  return NETWORKS[saved] ? saved : 'testnet4'
+}
+export function setPreferredNetwork(network) {
+  if (!NETWORKS[network]) throw new Error('unknown network: ' + network)
+  localStorage.setItem(NET_PREF_KEY, network)
+}
 
 let libs = null
 async function loadLibs() {
@@ -60,7 +81,7 @@ async function loadLibs() {
 }
 
 export class BtcWallet {
-  constructor({ network = 'testnet', scope } = {}) {
+  constructor({ network = preferredNetwork(), scope } = {}) {
     this.networkName = network
     this.net = NETWORKS[network]
     this.scope = scope ?? window.nostrPubkey ?? 'anon'
@@ -182,7 +203,7 @@ export class BtcWallet {
 }
 
 /** Per-user singleton (re-created when the nostr login changes). */
-export async function tipWallet(network = 'testnet') {
+export async function tipWallet(network = preferredNetwork()) {
   const scope = window.nostrPubkey ?? 'anon'
   const cache = (globalThis.__nostrClientBtcWallet ??= {})
   if (!cache.wallet || cache.scope !== scope || cache.network !== network) {
@@ -210,6 +231,7 @@ const WALLET_TEMPLATE = /* html */ `
   .head strong { font-size: 1.02rem; }
   .net { font-size: .68rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
     padding: .25em .8em; border-radius: 999px; background: #e5f3e9; color: #1d7a3f; }
+  .net.mainnet { background: #fdeaea; color: #c93a3a; }
   .balance { font-size: 1.9rem; font-weight: 800; letter-spacing: -0.02em; }
   .balance small { font-size: .85rem; font-weight: 500; color: var(--nc-soft, #6d6a76); }
   .addr { font-family: var(--nc-mono, ui-monospace, monospace); font-size: .72rem;
@@ -265,7 +287,7 @@ class NostrWallet extends HTMLElement {
   async _boot() {
     clearInterval(this._timer)
     try {
-      this.wallet = await tipWallet(this.getAttribute('network') || 'testnet')
+      this.wallet = await tipWallet(this.getAttribute('network') || preferredNetwork())
     } catch (err) {
       this.card.textContent = '✗ wallet failed to load: ' + (err.message || err)
       return
@@ -283,7 +305,7 @@ class NostrWallet extends HTMLElement {
     const title = document.createElement('strong')
     title.textContent = '₿ tip wallet'
     const net = document.createElement('span')
-    net.className = 'net'
+    net.className = 'net' + (w.networkName === 'mainnet' ? ' mainnet' : '')
     net.textContent = w.networkName
     head.append(title, net)
 
@@ -429,7 +451,7 @@ const TIP_TEMPLATE = /* html */ `
 <button class="btn" id="btn"><span>₿</span><span id="label">tip</span></button>
 <div class="menu" id="menu">
   <div class="presets" id="presets"></div>
-  <div class="note" id="note">on-chain testnet sats, sent instantly from your tip wallet</div>
+  <div class="note" id="note">on-chain sats, sent instantly from your tip wallet</div>
 </div>
 `
 
@@ -465,7 +487,7 @@ class BtcTipButton extends HTMLElement {
     if (this._recipient === window.nostrPubkey) return
     this.$('menu').classList.toggle('open')
     profiles().get(this._recipient, (p) => {
-      const field = NETWORKS[this.getAttribute('network') || 'testnet'].profileField
+      const field = NETWORKS[this.getAttribute('network') || preferredNetwork()].profileField
       this._address = p?.[field]
       if (!this._address) {
         this.$('presets').style.display = 'none'
@@ -480,18 +502,18 @@ class BtcTipButton extends HTMLElement {
     if (!this._address) return
     label.textContent = 'sending…'
     try {
-      const wallet = await tipWallet(this.getAttribute('network') || 'testnet')
+      const wallet = await tipWallet(this.getAttribute('network') || preferredNetwork())
       const { txid } = await wallet.send(this._address, sats)
       label.textContent = '✓ ' + formatSats(sats)
       // social proof receipt
       const signer = window.nostrSigner
       if (signer) {
-        const tags = [['p', this._recipient], ['t', 'onchain-tip'], ['amount', String(sats)], ['tx', txid]]
+        const tags = [['p', this._recipient], ['t', 'onchain-tip'], ['t', wallet.networkName], ['amount', String(sats)], ['tx', txid]]
         const eventId = this.getAttribute('event-id')
         if (/^[0-9a-f]{64}$/.test(eventId ?? '')) tags.push(['e', eventId])
         const event = await signer.signEvent({
           kind: 1, created_at: Math.floor(Date.now() / 1000), tags,
-          content: `₿ tipped ${sats} sats (testnet)\n${wallet.net.explorer}/tx/${txid}`,
+          content: `₿ tipped ${sats} sats (${wallet.networkName})\n${wallet.net.explorer}/tx/${txid}`,
         })
         defaultPool().publish(event)
       }
