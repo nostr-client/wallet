@@ -71,6 +71,8 @@ export function setPreferredNetwork(network) {
   localStorage.setItem(NET_PREF_KEY, network)
 }
 
+const hexToBytes = (hex) => new Uint8Array(hex.match(/.{2}/g).map((b) => parseInt(b, 16)))
+
 let libs = null
 async function loadLibs() {
   if (!libs) {
@@ -78,6 +80,18 @@ async function loadLibs() {
     libs = { btc: signer, secp256k1 }
   }
   return libs
+}
+
+/**
+ * THE KEY INSIGHT: a nostr pubkey IS a BIP-340 x-only secp256k1 key — exactly
+ * what a taproot output wants. So every npub deterministically has a bitcoin
+ * address, derivable by anyone from the pubkey alone, spendable by whoever
+ * holds the nostr secret. Nobody needs to publish a tip address.
+ */
+export async function nostrAddress(nostrPubkeyHex, network = preferredNetwork()) {
+  const { btc } = await loadLibs()
+  const params = network === 'mainnet' ? btc.NETWORK : btc.TEST_NETWORK
+  return btc.p2tr(hexToBytes(nostrPubkeyHex), undefined, params).address
 }
 
 export class BtcWallet {
@@ -91,24 +105,41 @@ export class BtcWallet {
 
   get netParams() { return this.networkName === 'mainnet' ? libs.btc.NETWORK : libs.btc.TEST_NETWORK }
 
-  /** Load (or create) the key and derive the address. */
+  /**
+   * Load the key and derive the address. If the nostr signer exposes its
+   * secret (guest/local/starter logins), the wallet IS the nostr key:
+   * a taproot address derived from the npub — same one anyone can compute
+   * to tip this user. Otherwise (NIP-07 extension) a per-user P2WPKH hot
+   * key is created, since the extension never reveals the secret.
+   */
   async init() {
     const { btc, secp256k1 } = await loadLibs()
-    const key = storageKey(this.networkName, this.scope)
-    let wif = localStorage.getItem(key)
-    if (!wif) {
-      const priv = crypto.getRandomValues(new Uint8Array(32))
-      wif = btc.WIF(this.netParams).encode(priv)
-      localStorage.setItem(key, wif)
+    const nostrSecret = window.nostrSigner?.secretHex
+    if (nostrSecret && this.scope === window.nostrPubkey) {
+      this._priv = hexToBytes(nostrSecret)
+      this._spend = btc.p2tr(hexToBytes(this.scope), undefined, this.netParams)
+      this.taproot = true
+      this.nostrNative = true
+    } else {
+      const key = storageKey(this.networkName, this.scope)
+      let wif = localStorage.getItem(key)
+      if (!wif) {
+        const priv = crypto.getRandomValues(new Uint8Array(32))
+        wif = btc.WIF(this.netParams).encode(priv)
+        localStorage.setItem(key, wif)
+      }
+      this._priv = btc.WIF(this.netParams).decode(wif)
+      const pub = secp256k1.getPublicKey(this._priv, true)
+      this._spend = btc.p2wpkh(pub, this.netParams)
     }
-    this._priv = btc.WIF(this.netParams).decode(wif)
-    const pub = secp256k1.getPublicKey(this._priv, true)
-    this._spend = btc.p2wpkh(pub, this.netParams)
     this.address = this._spend.address
     return this
   }
 
-  exportWIF() { return localStorage.getItem(storageKey(this.networkName, this.scope)) }
+  exportWIF() {
+    if (this.nostrNative) return null // the backup IS your nsec
+    return localStorage.getItem(storageKey(this.networkName, this.scope))
+  }
 
   async _api(path, options) {
     const res = await fetch(this.net.api + path, options)
@@ -152,7 +183,8 @@ export class BtcWallet {
     const utxos = (await this.utxos()).sort((a, b) => b.value - a.value)
     if (!utxos.length) throw new Error('wallet is empty — hit a faucet first')
 
-    const vsize = (ins, outs) => Math.ceil(10.5 + 68 * ins + 31 * outs)
+    const inVb = this.taproot ? 57.5 : 68
+    const vsize = (ins, outs) => Math.ceil(10.5 + inVb * ins + 31 * outs)
     const picked = []
     let inSum = 0, fee = 0
     for (const utxo of utxos) {
@@ -165,10 +197,12 @@ export class BtcWallet {
 
     const tx = new btc.Transaction()
     for (const utxo of picked) {
-      tx.addInput({
+      const input = {
         txid: utxo.txid, index: utxo.vout,
         witnessUtxo: { script: this._spend.script, amount: BigInt(utxo.value) },
-      })
+      }
+      if (this.taproot) input.tapInternalKey = hexToBytes(this.scope)
+      tx.addInput(input)
     }
     tx.addOutputAddress(to, BigInt(sats), this.netParams)
     const change = inSum - sats - fee
@@ -365,7 +399,7 @@ class NostrWallet extends HTMLElement {
 
     const row = document.createElement('div')
     row.className = 'row'
-    const publish = document.createElement('button')
+    let publish = document.createElement('button')
     publish.className = 'ghost'
     publish.textContent = 'Put address in my profile'
     publish.onclick = async () => {
@@ -375,11 +409,19 @@ class NostrWallet extends HTMLElement {
       catch (err) { this.status.textContent = '✗ ' + (err.message || err) }
       finally { publish.disabled = false }
     }
-    const backup = document.createElement('button')
-    backup.className = 'ghost'
-    backup.textContent = 'Backup key'
-    backup.onclick = () => { navigator.clipboard?.writeText(w.exportWIF()); this.status.textContent = '✓ WIF copied — store it safely' }
-    row.append(publish, backup)
+    if (w.nostrNative) {
+      const tag = document.createElement('span')
+      tag.className = 'faucets'
+      tag.textContent = '🔑 this wallet IS your nostr key — anyone can tip your npub, your nsec spends it'
+      row.append(tag)
+    } else {
+      const backup = document.createElement('button')
+      backup.className = 'ghost'
+      backup.textContent = 'Backup key'
+      backup.onclick = () => { navigator.clipboard?.writeText(w.exportWIF()); this.status.textContent = '✓ WIF copied — store it safely' }
+      row.append(backup)
+    }
+    row.prepend(publish)
 
     this.hist = document.createElement('div')
     this.hist.className = 'hist'
@@ -486,14 +528,20 @@ class BtcTipButton extends HTMLElement {
     if (!window.nostrPubkey) { this.$('label').textContent = 'log in to tip'; return }
     if (this._recipient === window.nostrPubkey) return
     this.$('menu').classList.toggle('open')
-    profiles().get(this._recipient, (p) => {
-      const field = NETWORKS[this.getAttribute('network') || preferredNetwork()].profileField
+    profiles().get(this._recipient, async (p) => {
+      const network = this.getAttribute('network') || preferredNetwork()
+      const field = NETWORKS[network].profileField
       this._address = p?.[field]
       if (!this._address) {
-        this.$('presets').style.display = 'none'
-        this.$('note').textContent = 'no tip address in their profile yet — they need to add one (wallet → "Put address in my profile")'
+        // no published address? their npub IS an address (taproot key-path)
+        this._address = await nostrAddress(this._recipient, network)
+        this.$('note').textContent = 'sent to the address derived from their nostr key — spendable with their nsec'
       }
     })
+    if (!this._address) {
+      const network = this.getAttribute('network') || preferredNetwork()
+      nostrAddress(this._recipient, network).then((addr) => { this._address ??= addr })
+    }
   }
 
   async _tip(sats) {
