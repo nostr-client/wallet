@@ -442,9 +442,12 @@ class NostrWallet extends HTMLElement {
       finally { publish.disabled = false }
     }
     if (w.nostrNative) {
+      // no "publish address" here: tippers derive this exact address from the
+      // npub, so there is nothing to announce. (A cold-wallet override can
+      // still be set via the profile-editor's btc fields.)
       const tag = document.createElement('span')
       tag.className = 'faucets'
-      tag.textContent = '🔑 this wallet IS your nostr key — anyone can tip your npub, your nsec spends it'
+      tag.textContent = '🔑 this wallet IS your nostr key — anyone can tip your npub, no setup needed'
       row.append(tag)
     } else {
       const backup = document.createElement('button')
@@ -453,7 +456,7 @@ class NostrWallet extends HTMLElement {
       backup.onclick = () => { navigator.clipboard?.writeText(w.exportWIF()); this.status.textContent = '✓ WIF copied — store it safely' }
       row.append(backup)
     }
-    row.prepend(publish)
+    if (!w.nostrNative) row.prepend(publish)
 
     this.hist = document.createElement('div')
     this.hist.className = 'hist'
