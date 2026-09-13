@@ -28,6 +28,19 @@ const CURVES_URL = 'https://esm.sh/@noble/curves@1.6.0/secp256k1'
 const UQR_URL = 'https://esm.sh/uqr@0.1.2'
 
 export const NETWORKS = {
+  // Bitcoin Knots' BLAKE2b fork of testnet4 (bitcoin blake): same tb1 addresses, its own chain
+  // from height 150,308, followed by mempool.guide. No faucet: mine free coins in a browser tab
+  // with datstr, paid straight to an address. Coins received on this chain do not exist on
+  // Core's testnet4, so a fresh wallet's spends cannot be replayed there.
+  txbt4: {
+    api: 'https://mempool.guide/testnet4/api',
+    explorer: 'https://mempool.guide/testnet4',
+    unit: 'tsat', coin: 'tXBT',
+    profileField: 'xbt_test',
+    faucets: [
+      'https://melvin.me/datstr/miner',
+    ],
+  },
   testnet4: {
     api: 'https://mempool.space/testnet4/api',
     explorer: 'https://mempool.space/testnet4',
@@ -143,7 +156,7 @@ export class BtcWallet {
 
   async _api(path, options) {
     const res = await fetch(this.net.api + path, options)
-    if (!res.ok) throw new Error(`mempool.space ${res.status}: ${(await res.text()).slice(0, 120)}`)
+    if (!res.ok) throw new Error(`${new URL(this.net.api).host} ${res.status}: ${(await res.text()).slice(0, 120)}`)
     return res
   }
 
