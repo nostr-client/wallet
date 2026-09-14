@@ -25,10 +25,12 @@
   <h1><a href="https://github.com/nostr-client/wallet">nostr-client / wallet</a></h1>
   <nostr-login></nostr-login>
 </header>
-<p class="nc-muted">A real bitcoin wallet in your tab — <strong>testnet</strong>,
-keys in localStorage, transactions signed in the browser, broadcast via
-mempool.space. Log in, grab sats from a faucet, and tip any note below
-instantly:</p>
+<p class="nc-muted">A real bitcoin wallet in your tab — keys in localStorage,
+transactions signed in the browser. Defaults to <strong>bitcoin blake</strong>,
+the BLAKE2b fork of testnet4 followed by
+<a href="https://mempool.guide/testnet4" target="_blank" rel="noopener">mempool.guide</a>;
+Core's testnet4, testnet3 and mainnet are available too. Log in and tip any note
+below instantly:</p>
 <div class="cols">
   <nostr-wallet></nostr-wallet>
   <div><h2>Live notes — hover ₿ tip</h2><nostr-feed limit="6"></nostr-feed></div>

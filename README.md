@@ -32,7 +32,7 @@ publish a tip address; everybody is tippable from day zero.
 
 | id | label | chain | explorer | coins from |
 |---|---|---|---|---|
-| `txbt4` | bitcoin blake | BLAKE2b fork of testnet4, split at block 150,308 | [mempool.guide](https://mempool.guide/testnet4) | mining (no public faucet) |
+| `txbt4` **(default)** | bitcoin blake | BLAKE2b fork of testnet4, split at block 150,308 | [mempool.guide](https://mempool.guide/testnet4) | mining (no public faucet) |
 | `testnet4` | testnet4 | Bitcoin Core's test chain | mempool.space | faucets |
 | `testnet` | testnet3 | the legacy test chain | mempool.space | faucets |
 | `mainnet` | mainnet | real bitcoin | mempool.space | ⚠ your own |
@@ -42,7 +42,8 @@ not — coins received on bitcoin blake do not exist on Core's testnet4, so a
 spend on one cannot be replayed on the other. Each network keeps its own key
 and balance.
 
-A host page picks which network it *starts* on — set
+Every app starts on `txbt4` (`DEFAULT_NETWORK`). A host page can override which
+network it *starts* on — set
 `globalThis.__nostrClientBtcNetwork = 'txbt4'` **before** importing (the custom
 elements boot on import), or call `setDefaultNetwork()` from a module that
 loads first. The user's own choice via `setPreferredNetwork()` always wins and

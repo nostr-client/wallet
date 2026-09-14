@@ -17,10 +17,11 @@
  * publishes a kind-1 receipt tagged ['t','onchain-tip'] with the txid, so
  * tips are visible social proof without any custodial receipt server.
  *
- * NETWORKS: bitcoin blake (txbt4, BLAKE2b fork of testnet4 — mined, no faucet),
- * Core's testnet4, testnet3, mainnet. A host page picks the starting network with
- * globalThis.__nostrClientBtcNetwork before importing; the user's own choice
- * (setPreferredNetwork) always wins and is persisted per browser.
+ * NETWORKS: bitcoin blake (txbt4, BLAKE2b fork of testnet4 — mined, no faucet)
+ * is the DEFAULT; Core's testnet4, testnet3 and mainnet are also available. A
+ * host page can override the starting network with globalThis.__nostrClientBtcNetwork
+ * before importing; the user's own choice (setPreferredNetwork) always wins and
+ * is persisted per browser.
  *
  * SECURITY: the key is a hot wallet in localStorage, scoped per nostr pubkey.
  * Treat it like pocket change. Testnet by default — sats are free.
@@ -87,12 +88,15 @@ export const NETWORKS = {
 const storageKey = (network, scope) => `nostr-client:btc-wallet:${network}:${scope}`
 const NET_PREF_KEY = 'nostr-client:btc-network'
 
+/** The chain every nostr-client app starts on unless it says otherwise. */
+export const DEFAULT_NETWORK = 'txbt4'
+
 const NET_DEFAULT_GLOBAL = '__nostrClientBtcNetwork'
 
 /**
  * The network an app starts on when the user has never chosen one. A host page
- * can be blake-first (btcnostr) or testnet4-first without touching anyone's
- * saved preference, the same way it composes a pool: set
+ * can override DEFAULT_NETWORK without touching anyone's saved preference,
+ * the same way it composes a pool: set
  *   globalThis.__nostrClientBtcNetwork = 'txbt4'
  * BEFORE importing this module (components boot on import), or call
  * setDefaultNetwork() from a module that loads first.
@@ -102,7 +106,7 @@ export function setDefaultNetwork(network) {
   globalThis[NET_DEFAULT_GLOBAL] = network
 }
 const fallbackNetwork = () =>
-  NETWORKS[globalThis[NET_DEFAULT_GLOBAL]] ? globalThis[NET_DEFAULT_GLOBAL] : 'testnet4'
+  NETWORKS[globalThis[NET_DEFAULT_GLOBAL]] ? globalThis[NET_DEFAULT_GLOBAL] : DEFAULT_NETWORK
 
 /** The user's chosen network (Settings), else the host page's default. */
 export function preferredNetwork() {
@@ -538,28 +542,30 @@ class NostrWallet extends HTMLElement {
 
   async _refresh() {
     try {
-      const { total, mempool } = await this.wallet.balance()
-      this.balanceEl.innerHTML = ''
-      this.balanceEl.append(formatSats(total))
-      const small = document.createElement('small')
-      const price = await btcUsd()
+      const wallet = this.wallet
+      const [{ total, mempool }, price, history] = await Promise.all([
+        wallet.balance(), btcUsd(), wallet.history(6),
+      ])
+      if (this.wallet !== wallet) return // a re-boot overtook us
+
       const usd = satsToUsd(total, price)
       const bits = []
       if (total === 0) {
-        bits.push(this.wallet.net.faucets.length
+        bits.push(wallet.net.faucets.length
           ? 'empty — grab free sats from a faucet below'
-          : 'empty')
+          : 'empty — no faucet on this chain, coins come from mining')
       }
-      if (usd !== null && total > 0) bits.push('\u2248 $' + usd.toFixed(usd < 10 ? 2 : 0) + (this.wallet.networkName === 'mainnet' ? '' : ' at mainnet price'))
+      if (usd !== null && total > 0) bits.push('\u2248 $' + usd.toFixed(usd < 10 ? 2 : 0) + (wallet.networkName === 'mainnet' ? '' : ' at mainnet price'))
       if (mempool) bits.push(`${mempool > 0 ? '+' : ''}${mempool} unconfirmed`)
+      const small = document.createElement('small')
       small.textContent = bits.length ? ' (' + bits.join(' \u00b7 ') + ')' : ''
-      this.balanceEl.append(small)
+
+      this.balanceEl.replaceChildren(formatSats(total), small)
       this.dispatchEvent(new CustomEvent('nostr:wallet-balance', { detail: { total }, bubbles: true, composed: true }))
-      const history = await this.wallet.history(6)
       this.hist.innerHTML = ''
       for (const tx of history) {
         const a = document.createElement('a')
-        a.href = this.wallet.net.explorer + '/tx/' + tx.txid
+        a.href = wallet.net.explorer + '/tx/' + tx.txid
         a.target = '_blank'; a.rel = 'noopener'
         const what = document.createElement('span')
         what.textContent = tx.confirmed ? ago(tx.time) : '⏳ pending'
