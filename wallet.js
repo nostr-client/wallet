@@ -1,7 +1,8 @@
 /**
  * wallet.js — an in-browser bitcoin wallet for nostr tipping. TESTNET-FIRST.
  * No build step. Crypto from pinned CDN ESM (@scure/btc-signer, @noble/curves);
- * chain data from mempool.space. Keys never leave the browser.
+ * chain data from Esplora-compatible explorers (mempool.space, and mempool.guide
+ * for the bitcoin blake chain). Keys never leave the browser.
  *
  * Part of https://github.com/nostr-client — one repo, one thing.
  * License: AGPL-3.0-or-later
@@ -16,8 +17,13 @@
  * publishes a kind-1 receipt tagged ['t','onchain-tip'] with the txid, so
  * tips are visible social proof without any custodial receipt server.
  *
+ * NETWORKS: bitcoin blake (txbt4, BLAKE2b fork of testnet4 — mined, no faucet),
+ * Core's testnet4, testnet3, mainnet. A host page picks the starting network with
+ * globalThis.__nostrClientBtcNetwork before importing; the user's own choice
+ * (setPreferredNetwork) always wins and is persisted per browser.
+ *
  * SECURITY: the key is a hot wallet in localStorage, scoped per nostr pubkey.
- * Treat it like pocket change. Testnet by default — sats from a faucet.
+ * Treat it like pocket change. Testnet by default — sats are free.
  */
 
 import { defaultPool } from 'https://nostr-client.github.io/pool/pool.js'
@@ -28,41 +34,48 @@ const CURVES_URL = 'https://esm.sh/@noble/curves@1.6.0/secp256k1'
 const UQR_URL = 'https://esm.sh/uqr@0.1.2'
 
 export const NETWORKS = {
-  // Bitcoin Knots' BLAKE2b fork of testnet4 (bitcoin blake): same tb1 addresses, its own chain
-  // from height 150,308, followed by mempool.guide. No faucet: mine free coins in a browser tab
-  // with datstr, paid straight to an address. Coins received on this chain do not exist on
-  // Core's testnet4, so a fresh wallet's spends cannot be replayed there.
+  // Bitcoin Knots' BLAKE2b fork of testnet4 ("bitcoin blake"): same tb1 addresses,
+  // its own chain from height 150,308, followed by mempool.guide. (Block 150,307 is
+  // identical on both chains; 150,308 is where they split.) Coins received here do
+  // not exist on Core's testnet4, so spends cannot be replayed there. Coins come
+  // from mining — there is no public faucet for this chain yet.
   txbt4: {
+    label: 'bitcoin blake',
+    blurb: "the BLAKE2b fork of testnet4, followed by mempool.guide",
     api: 'https://mempool.guide/testnet4/api',
     explorer: 'https://mempool.guide/testnet4',
     unit: 'tsat', coin: 'tXBT',
     profileField: 'xbt_test',
-    faucets: [
-      'https://melvin.me/datstr/miner',
-    ],
+    faucets: [],
   },
   testnet4: {
+    label: 'testnet4',
+    blurb: "Bitcoin Core's test chain — coins come from public faucets",
     api: 'https://mempool.space/testnet4/api',
     explorer: 'https://mempool.space/testnet4',
     unit: 'tsat', coin: 'tBTC',
     profileField: 'btc_test',
     faucets: [
-      'https://coinfaucet.eu/en/btc-testnet4/',
-      'https://faucet.testnet4.dev/',
+      { url: 'https://coinfaucet.eu/en/btc-testnet4/', name: 'coinfaucet.eu' },
+      { url: 'https://faucet.testnet4.dev/', name: 'faucet.testnet4.dev' },
     ],
   },
   testnet: {
+    label: 'testnet3',
+    blurb: 'the legacy test chain — still the best-stocked faucets',
     api: 'https://mempool.space/testnet/api',
     explorer: 'https://mempool.space/testnet',
     unit: 'tsat', coin: 'tBTC',
     profileField: 'btc_test',
     faucets: [
-      'https://bitcoinfaucet.uo1.net/',
-      'https://coinfaucet.eu/en/btc-testnet/',
-      'https://testnet-faucet.com/btc-testnet/',
+      { url: 'https://bitcoinfaucet.uo1.net/', name: 'bitcoinfaucet.uo1.net' },
+      { url: 'https://coinfaucet.eu/en/btc-testnet/', name: 'coinfaucet.eu' },
+      { url: 'https://testnet-faucet.com/btc-testnet/', name: 'testnet-faucet.com' },
     ],
   },
   mainnet: {
+    label: 'mainnet',
+    blurb: 'real bitcoin — a hot wallet in your browser, pocket change only',
     api: 'https://mempool.space/api',
     explorer: 'https://mempool.space',
     unit: 'sat', coin: 'BTC',
@@ -74,15 +87,35 @@ export const NETWORKS = {
 const storageKey = (network, scope) => `nostr-client:btc-wallet:${network}:${scope}`
 const NET_PREF_KEY = 'nostr-client:btc-network'
 
-/** The user's chosen network (Settings). Default: testnet4. */
+const NET_DEFAULT_GLOBAL = '__nostrClientBtcNetwork'
+
+/**
+ * The network an app starts on when the user has never chosen one. A host page
+ * can be blake-first (btcnostr) or testnet4-first without touching anyone's
+ * saved preference, the same way it composes a pool: set
+ *   globalThis.__nostrClientBtcNetwork = 'txbt4'
+ * BEFORE importing this module (components boot on import), or call
+ * setDefaultNetwork() from a module that loads first.
+ */
+export function setDefaultNetwork(network) {
+  if (!NETWORKS[network]) throw new Error('unknown network: ' + network)
+  globalThis[NET_DEFAULT_GLOBAL] = network
+}
+const fallbackNetwork = () =>
+  NETWORKS[globalThis[NET_DEFAULT_GLOBAL]] ? globalThis[NET_DEFAULT_GLOBAL] : 'testnet4'
+
+/** The user's chosen network (Settings), else the host page's default. */
 export function preferredNetwork() {
   const saved = localStorage.getItem(NET_PREF_KEY)
-  return NETWORKS[saved] ? saved : 'testnet4'
+  return NETWORKS[saved] ? saved : fallbackNetwork()
 }
 export function setPreferredNetwork(network) {
   if (!NETWORKS[network]) throw new Error('unknown network: ' + network)
   localStorage.setItem(NET_PREF_KEY, network)
 }
+
+/** Human label for a network id — 'testnet' is spelled 'testnet3' to users. */
+export const networkLabel = (network) => NETWORKS[network]?.label ?? network
 
 const hexToBytes = (hex) => new Uint8Array(hex.match(/.{2}/g).map((b) => parseInt(b, 16)))
 
@@ -284,6 +317,15 @@ export async function btcUsd() {
 }
 export const satsToUsd = (sats, price) => price ? (sats / 1e8) * price : null
 
+/** Compact relative time for a unix seconds stamp: "3m", "5h", "2d". */
+export function ago(unixSeconds) {
+  const secs = Math.max(0, Math.floor(Date.now() / 1000) - (unixSeconds ?? 0))
+  if (secs < 60) return secs + 's'
+  if (secs < 3600) return Math.floor(secs / 60) + 'm'
+  if (secs < 86_400) return Math.floor(secs / 3600) + 'h'
+  return Math.floor(secs / 86_400) + 'd'
+}
+
 export const formatSats = (sats) =>
   sats >= 100_000_000 ? (sats / 100_000_000).toFixed(4) + ' BTC' : sats.toLocaleString() + ' sats'
 
@@ -301,6 +343,8 @@ const WALLET_TEMPLATE = /* html */ `
   .head strong { font-size: 1.02rem; }
   .net { font-size: .68rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
     padding: .25em .8em; border-radius: 999px; background: #e5f3e9; color: #1d7a3f; }
+  .net { text-decoration: none; }
+  .net:hover { filter: brightness(.96); }
   .net.mainnet { background: #fdeaea; color: #c93a3a; }
   .balance { font-size: 1.9rem; font-weight: 800; letter-spacing: -0.02em; }
   .balance small { font-size: .85rem; font-weight: 500; color: var(--nc-soft, #6d6a76); }
@@ -374,9 +418,12 @@ class NostrWallet extends HTMLElement {
     head.className = 'head'
     const title = document.createElement('strong')
     title.textContent = '₿ tip wallet'
-    const net = document.createElement('span')
+    const net = document.createElement('a')
     net.className = 'net' + (w.networkName === 'mainnet' ? ' mainnet' : '')
-    net.textContent = w.networkName === 'testnet' ? 'testnet3' : w.networkName
+    net.href = w.net.explorer
+    net.target = '_blank'; net.rel = 'noopener'
+    net.textContent = networkLabel(w.networkName)
+    net.title = w.net.blurb + ' — open the explorer'
     head.append(title, net)
 
     this.balanceEl = document.createElement('div')
@@ -478,10 +525,10 @@ class NostrWallet extends HTMLElement {
     faucets.className = 'faucets'
     if (w.net.faucets.length) {
       faucets.append('free testnet sats: ')
-      w.net.faucets.forEach((url, i) => {
+      w.net.faucets.forEach(({ url, name }, i) => {
         const a = document.createElement('a')
         a.href = url; a.target = '_blank'; a.rel = 'noopener'
-        a.textContent = 'faucet ' + (i + 1)
+        a.textContent = name
         faucets.append(i ? ' · ' : '', a)
       })
     }
@@ -498,7 +545,11 @@ class NostrWallet extends HTMLElement {
       const price = await btcUsd()
       const usd = satsToUsd(total, price)
       const bits = []
-      if (total === 0 && this.wallet.net.faucets.length) bits.push('empty — grab free sats from a faucet below')
+      if (total === 0) {
+        bits.push(this.wallet.net.faucets.length
+          ? 'empty — grab free sats from a faucet below'
+          : 'empty')
+      }
       if (usd !== null && total > 0) bits.push('\u2248 $' + usd.toFixed(usd < 10 ? 2 : 0) + (this.wallet.networkName === 'mainnet' ? '' : ' at mainnet price'))
       if (mempool) bits.push(`${mempool > 0 ? '+' : ''}${mempool} unconfirmed`)
       small.textContent = bits.length ? ' (' + bits.join(' \u00b7 ') + ')' : ''
@@ -511,10 +562,11 @@ class NostrWallet extends HTMLElement {
         a.href = this.wallet.net.explorer + '/tx/' + tx.txid
         a.target = '_blank'; a.rel = 'noopener'
         const what = document.createElement('span')
-        what.textContent = (tx.confirmed ? '' : '⏳ ') + tx.txid.slice(0, 12) + '…'
+        what.textContent = tx.confirmed ? ago(tx.time) : '⏳ pending'
+        what.title = tx.txid
         const amt = document.createElement('span')
         amt.className = tx.delta >= 0 ? 'in' : 'out'
-        amt.textContent = (tx.delta >= 0 ? '+' : '') + tx.delta.toLocaleString()
+        amt.textContent = (tx.delta >= 0 ? '+' : '−') + Math.abs(tx.delta).toLocaleString() + ' sats'
         a.append(what, amt)
         this.hist.append(a)
       }
