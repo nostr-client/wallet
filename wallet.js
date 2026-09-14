@@ -243,7 +243,9 @@ export class BtcWallet {
   }
 
   async _api(path, options) {
-    const res = await fetch(this.net.api + path, options)
+    // an explorer that accepts the connection and never answers would otherwise
+    // hang the balance poll forever, stacking one dead request every 30s
+    const res = await fetch(this.net.api + path, { signal: AbortSignal.timeout(12_000), ...options })
     if (!res.ok) throw new Error(`${new URL(this.net.api).host} ${res.status}: ${(await res.text()).slice(0, 400)}`)
     return res
   }
@@ -416,15 +418,18 @@ export async function tipWallet(network = preferredNetwork()) {
 }
 
 /** BTC spot price (Coinbase), cached 5 min. Returns null offline. */
-let _usd = null, _usdAt = 0
+let _usd = null, _usdAt = 0, _usdInflight = null
 export async function btcUsd() {
   if (_usd && Date.now() - _usdAt < 300_000) return _usd
-  try {
-    const res = await fetch('https://api.coinbase.com/v2/prices/BTC-USD/spot')
-    _usd = Number((await res.json()).data.amount)
-    _usdAt = Date.now()
-  } catch {}
-  return _usd
+  // every note card has a tip button and every tip button asks for the price,
+  // so without in-flight dedup one feed paint fires ~30 parallel requests and
+  // Coinbase rate-limits the lot
+  _usdInflight ??= fetch('https://api.coinbase.com/v2/prices/BTC-USD/spot', { signal: AbortSignal.timeout(8000) })
+    .then((res) => res.json())
+    .then((body) => { _usd = Number(body.data.amount); _usdAt = Date.now(); return _usd })
+    .catch(() => _usd)
+    .finally(() => { _usdInflight = null })
+  return _usdInflight
 }
 export const satsToUsd = (sats, price) => price ? (sats / 1e8) * price : null
 
@@ -510,22 +515,45 @@ class NostrWallet extends HTMLElement {
     this.attachShadow({ mode: 'open' }).innerHTML = WALLET_TEMPLATE
     this.card = this.shadowRoot.getElementById('card')
     this._onAuth = () => this._boot()
+    this._visible = false
+    this._onVisible = () => { if (document.visibilityState === 'visible' && this._visible) this._refresh() }
   }
 
   connectedCallback() {
     window.addEventListener('nostr:login', this._onAuth)
     window.addEventListener('nostr:logout', this._onAuth)
-    this._boot()
+    document.addEventListener('visibilitychange', this._onVisible)
+    // Host pages hide inactive views with display:none, which does NOT stop a
+    // custom element booting. Without this, every visitor — logged out, never
+    // opening the Wallet tab — imported ~250KB of signing libs and polled a
+    // block explorer every 30s forever. Only wake when actually on screen.
+    this._io = new IntersectionObserver((entries) => {
+      const visible = entries.some((e) => e.isIntersecting)
+      if (visible === this._visible) return
+      this._visible = visible
+      if (visible) this._boot(); else this._sleep()
+    })
+    this._io.observe(this)
   }
 
   disconnectedCallback() {
     window.removeEventListener('nostr:login', this._onAuth)
     window.removeEventListener('nostr:logout', this._onAuth)
-    clearInterval(this._timer)
+    document.removeEventListener('visibilitychange', this._onVisible)
+    this._io?.disconnect()
+    this._sleep()
   }
 
+  _sleep() { clearInterval(this._timer); this._timer = null }
+
   async _boot() {
-    clearInterval(this._timer)
+    this._sleep()
+    if (!this._visible) return
+    // never mint a throwaway key for a logged-out visitor
+    if (!window.nostrPubkey) {
+      this.card.textContent = 'Log in to use the tip wallet.'
+      return
+    }
     try {
       this.wallet = await tipWallet(this.getAttribute('network') || preferredNetwork())
     } catch (err) {
@@ -534,7 +562,9 @@ class NostrWallet extends HTMLElement {
     }
     this._render()
     this._refresh()
-    this._timer = setInterval(() => this._refresh(), 30_000)
+    this._timer = setInterval(() => {
+      if (document.visibilityState === 'visible') this._refresh()
+    }, 30_000)
   }
 
   _render() {
@@ -663,13 +693,23 @@ class NostrWallet extends HTMLElement {
   }
 
   async _refresh() {
+    if (this._refreshing) return
+    this._refreshing = true
     try {
       const wallet = this.wallet
-      const [{ total, mempool }, price, history, spend] = await Promise.all([
-        wallet.balance(), btcUsd(), wallet.history(6),
-        wallet.spendableUtxos().catch(() => ({ immature: 0 })),
+      // allSettled, not all: one 429 on /txs must not blank the balance too
+      const [balRes, priceRes, histRes, spendRes] = await Promise.allSettled([
+        wallet.balance(), btcUsd(), wallet.history(6), wallet.spendableUtxos(),
       ])
       if (this.wallet !== wallet) return // a re-boot overtook us
+      if (balRes.status === 'rejected') {
+        this.status.textContent = '⚠ could not reach ' + new URL(wallet.net.api).host
+        return
+      }
+      const { total, mempool } = balRes.value
+      const price = priceRes.status === 'fulfilled' ? priceRes.value : null
+      const history = histRes.status === 'fulfilled' ? histRes.value : []
+      const spend = spendRes.status === 'fulfilled' ? spendRes.value : { immature: 0 }
 
       const usd = satsToUsd(total, price)
       const bits = []
@@ -702,6 +742,7 @@ class NostrWallet extends HTMLElement {
         this.hist.append(a)
       }
     } catch { /* offline / rate limited — keep last shown */ }
+    finally { this._refreshing = false }
   }
 }
 
@@ -726,11 +767,41 @@ const TIP_TEMPLATE = /* html */ `
   .presets button:hover { border-color: #f7931a; color: #b26205; background: #fff7ec; }
   .note { font-size: .72rem; color: var(--nc-faint, #a8a4b0); margin-top: .5rem; line-height: 1.35; }
   .note a { color: #f7931a; }
+  .net { font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+    color: #1d7a3f; background: #e5f3e9; border-radius: 999px; padding: .15em .6em; }
+  .net.real { color: #c93a3a; background: #fdeaea; }
+  .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: .5rem; }
+  .head b { font-size: .78rem; }
+  .confirm { display: none; }
+  .confirm.open { display: block; }
+  .presets.hide { display: none; }
+  .rows { display: grid; gap: .25rem; font-size: .74rem; margin-bottom: .6rem; }
+  .rows div { display: flex; justify-content: space-between; gap: .6rem; }
+  .rows span:first-child { color: var(--nc-faint, #a8a4b0); }
+  .rows b { font-weight: 650; text-align: right; overflow-wrap: anywhere; }
+  .warn { font-size: .72rem; color: #b26205; background: #fff7ec; border-radius: 8px;
+    padding: .4em .6em; margin-bottom: .6rem; line-height: 1.35; }
+  .warn.real { color: #c93a3a; background: #fdeaea; }
+  .acts { display: grid; grid-template-columns: 1fr 1fr; gap: .4rem; }
+  .acts button { font: inherit; font-size: .78rem; font-weight: 700; cursor: pointer;
+    border-radius: 8px; padding: .5em 0; border: 1px solid var(--nc-line, #e9e6e0); background: none; color: inherit; }
+  .acts .go { background: #f7931a; color: #fff; border-color: #f7931a; }
+  .acts button:disabled { opacity: .5; cursor: default; }
 </style>
 <button class="btn" id="btn"><span>₿</span><span id="label">tip</span></button>
 <div class="menu" id="menu">
+  <div class="head"><b>Send a tip</b><span class="net" id="net"></span></div>
   <div class="presets" id="presets"></div>
-  <div class="note" id="note">on-chain sats, sent instantly from your tip wallet</div>
+  <div class="confirm" id="confirm">
+    <div class="rows">
+      <div><span>amount</span><b id="c-amt"></b></div>
+      <div><span>network fee</span><b id="c-fee">…</b></div>
+      <div><span>to</span><b id="c-to"></b></div>
+    </div>
+    <div class="warn" id="c-warn"></div>
+    <div class="acts"><button id="c-cancel">Cancel</button><button class="go" id="c-go">Send</button></div>
+  </div>
+  <div class="note" id="note">on-chain sats, sent from your tip wallet</div>
 </div>
 `
 
@@ -750,7 +821,7 @@ class BtcTipButton extends HTMLElement {
       const b = document.createElement('button')
       b.textContent = sats >= 1000 ? (sats / 1000) + 'k' : sats
       b.title = sats + ' sats'
-      b.onclick = () => this._tip(sats)
+      b.onclick = () => this._stage(sats)
       presets.append(b)
     }
     btcUsd().then((price) => {
@@ -775,26 +846,75 @@ class BtcTipButton extends HTMLElement {
   _open() {
     if (!window.nostrPubkey) { this.$('label').textContent = 'log in to tip'; return }
     if (this._recipient === window.nostrPubkey) return
-    this.$('menu').classList.toggle('open')
+    const open = !this.$('menu').classList.contains('open')
+    this.$('menu').classList.toggle('open', open)
+    if (!open) return
+    // a cached address from a previous network/recipient would send to the wrong
+    // chain — every test chain shares the same tb1 address format
+    const network = this.getAttribute('network') || preferredNetwork()
+    if (this._addressFor !== this._recipient + ':' + network) this._address = null
+    this._addressFor = this._recipient + ':' + network
+    this._showPresets()
+    const net = this.$('net')
+    net.textContent = networkLabel(network)
+    net.classList.toggle('real', network === 'mainnet')
     profiles().get(this._recipient, async (p) => {
-      const network = this.getAttribute('network') || preferredNetwork()
       const field = NETWORKS[network].profileField
+      this._published = !!p?.[field]
       this._address = p?.[field]
       if (!this._address) {
         // no published address? their npub IS an address (taproot key-path)
         this._address = await nostrAddress(this._recipient, network)
-        this.$('note').textContent = 'sent to the address derived from their nostr key — spendable with their nsec'
+        this.$('note').textContent = 'they have not published a tip address; this goes to the address derived from their nostr key'
       }
     })
     if (!this._address) {
-      const network = this.getAttribute('network') || preferredNetwork()
       nostrAddress(this._recipient, network).then((addr) => { this._address ??= addr })
     }
+  }
+
+  _showPresets() {
+    this.$('presets').classList.remove('hide')
+    this.$('confirm').classList.remove('open')
+  }
+
+  /**
+   * Stage a tip for confirmation. Broadcasting bitcoin is irreversible, and this
+   * button sits on every note in a scrolling feed — so show what is about to
+   * happen (amount, real fee, destination, chain) and make the user say yes.
+   */
+  async _stage(sats) {
+    if (!this._address) { this.$('note').textContent = 'still resolving their address — try again in a second'; return }
+    const network = this.getAttribute('network') || preferredNetwork()
+    this.$('presets').classList.add('hide')
+    this.$('confirm').classList.add('open')
+    this.$('c-amt').textContent = formatSats(sats)
+    this.$('c-to').textContent = this._address.slice(0, 10) + '…' + this._address.slice(-6)
+    this.$('c-to').title = this._address
+    this.$('c-fee').textContent = 'estimating…'
+    const warn = this.$('c-warn')
+    warn.classList.toggle('real', network === 'mainnet')
+    warn.textContent = network === 'mainnet'
+      ? '⚠ REAL bitcoin on mainnet. This cannot be undone.'
+      : this._published
+        ? 'On-chain and irreversible. Chain: ' + networkLabel(network) + '.'
+        : 'They have not published a tip address. This goes to an address derived from their nostr key — only spendable with their nsec, so a browser-extension user may not be able to claim it.'
+    const go = this.$('c-go')
+    go.disabled = false
+    this.$('c-cancel').onclick = () => this._showPresets()
+    go.onclick = () => { go.disabled = true; this._tip(sats) }
+    // show the real fee this transaction will pay, before they commit
+    try {
+      const wallet = await tipWallet(network)
+      const rate = await wallet.feeRate()
+      this.$('c-fee').textContent = `~${rate} sat/vB`
+    } catch { this.$('c-fee').textContent = 'unavailable' }
   }
 
   async _tip(sats) {
     const label = this.$('label')
     this.$('menu').classList.remove('open')
+    this._showPresets()
     if (!this._address) return
     label.textContent = 'sending…'
     try {
