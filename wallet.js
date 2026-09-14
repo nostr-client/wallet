@@ -121,6 +121,56 @@ export function setPreferredNetwork(network) {
 /** Human label for a network id — 'testnet' is spelled 'testnet3' to users. */
 export const networkLabel = (network) => NETWORKS[network]?.label ?? network
 
+/** Coinbase outputs can't be spent until this many confirmations. */
+const COINBASE_MATURITY = 100
+
+/**
+ * Bytes an output paying `address` adds to a transaction: 8 (value) + 1 (script
+ * length) + the scriptPubKey. Outputs are never witness-discounted, so this is
+ * vbytes too. A taproot output is 43 B — NOT the 31 B of a P2WPKH, which is what
+ * this used to assume for every output. Underestimating here underpays the fee.
+ */
+function outputVbytes(btc, address, params) {
+  try { return 9 + btc.OutScript.encode(btc.Address(params).decode(address)).length }
+  catch { return 43 } // unknown/undecodable: assume the largest common output
+}
+
+/**
+ * Bitcoin Core's dust threshold for an output paying `address`:
+ * (serialized output + the cost of spending it) * 3 sat/vB dustRelayFee.
+ * P2WPKH is 294, but taproot and P2WSH are 330 and P2PKH is 546 — so a single
+ * hardcoded 294 silently builds dust outputs that the network rejects.
+ */
+function dustThreshold(btc, address, params) {
+  try {
+    const decoded = btc.Address(params).decode(address)
+    const len = btc.OutScript.encode(decoded).length
+    const witness = decoded.type === 'tr' || decoded.type === 'wpkh' || decoded.type === 'wsh'
+    return (9 + len + (witness ? 67 : 148)) * 3
+  } catch { return 330 }
+}
+
+/** Turn a node's terse broadcast rejection into something a person can act on. */
+export function explainBroadcastError(raw) {
+  const text = String(raw ?? '')
+  const low = text.toLowerCase()
+  const say = (msg) => msg + ' \u2014 ' + text
+  if (low.includes('min relay fee') || low.includes('insufficient fee') || low.includes('min-relay'))
+    return say('fee too low for this chain')
+  if (low.includes('dust')) return say('one output is below the dust limit')
+  if (low.includes('premature-spend-of-coinbase') || low.includes('immature'))
+    return say(`those coins are freshly mined and need ${COINBASE_MATURITY} confirmations`)
+  if (low.includes('missingorspent') || low.includes('missing inputs') || low.includes('txn-mempool-conflict'))
+    return say('those coins were already spent — reload to refresh the wallet')
+  if (low.includes('txn-already-known') || low.includes('already-in-chain') || low.includes('code\\":-27'))
+    return say('this transaction was already broadcast')
+  if (low.includes('non-mandatory-script-verify') || low.includes('script-verify'))
+    return say('the signature was rejected')
+  if (low.includes('too-long-mempool-chain')) return say('too many unconfirmed parents — wait for a block')
+  if (low.includes('-26')) return say('the node rejected it under its mempool policy')
+  return text
+}
+
 const hexToBytes = (hex) => new Uint8Array(hex.match(/.{2}/g).map((b) => parseInt(b, 16)))
 
 let libs = null
@@ -193,7 +243,7 @@ export class BtcWallet {
 
   async _api(path, options) {
     const res = await fetch(this.net.api + path, options)
-    if (!res.ok) throw new Error(`${new URL(this.net.api).host} ${res.status}: ${(await res.text()).slice(0, 120)}`)
+    if (!res.ok) throw new Error(`${new URL(this.net.api).host} ${res.status}: ${(await res.text()).slice(0, 400)}`)
     return res
   }
 
@@ -207,6 +257,36 @@ export class BtcWallet {
 
   async utxos() { return (await this._api('/address/' + this.address + '/utxo')).json() }
 
+  async _isCoinbase(txid) {
+    this._coinbase ??= new Map()
+    if (!this._coinbase.has(txid)) {
+      const tx = await (await this._api('/tx/' + txid)).json()
+      this._coinbase.set(txid, !!tx.vin?.[0]?.is_coinbase)
+    }
+    return this._coinbase.get(txid)
+  }
+
+  /**
+   * UTXOs that can actually be spent right now. Coinbase outputs are unspendable
+   * until COINBASE_MATURITY confirmations, and a chain whose coins come from
+   * mining (bitcoin blake) hands out exactly those — the balance looks spendable
+   * and every broadcast is rejected. Only shallow UTXOs cost an extra lookup.
+   */
+  async spendableUtxos() {
+    const all = await this.utxos()
+    if (!all.length) return { spendable: [], immature: 0 }
+    const tip = Number(await (await this._api('/blocks/tip/height')).text())
+    const spendable = []
+    let immature = 0
+    for (const utxo of all) {
+      const height = utxo.status?.block_height
+      const depth = height ? tip - height + 1 : 0
+      if (depth < COINBASE_MATURITY && await this._isCoinbase(utxo.txid)) { immature += utxo.value; continue }
+      spendable.push(utxo)
+    }
+    return { spendable, immature }
+  }
+
   async history(limit = 12) {
     const txs = await (await this._api('/address/' + this.address + '/txs')).json()
     return txs.slice(0, limit).map((tx) => {
@@ -217,14 +297,15 @@ export class BtcWallet {
     })
   }
 
-  /** Largest amount send() can deliver right now (all UTXOs, minus fee). */
+  /** Largest amount send() can deliver right now (spendable UTXOs, minus fee). */
   async maxSendable({ feeRate } = {}) {
     const rate = feeRate ?? await this.feeRate()
-    const utxos = await this.utxos()
-    if (!utxos.length) return 0
+    const { spendable } = await this.spendableUtxos()
+    if (!spendable.length) return 0
     const inVb = this.taproot ? 57.5 : 68
-    const fee = Math.ceil(10.5 + inVb * utxos.length + 31 * 2) * rate
-    return Math.max(0, utxos.reduce((sum, u) => sum + u.value, 0) - fee)
+    // two taproot outputs: the largest common case, so send() always fits
+    const fee = Math.ceil(10.5 + inVb * spendable.length + 43 * 2) * rate
+    return Math.max(0, spendable.reduce((sum, u) => sum + u.value, 0) - fee)
   }
 
   async feeRate() {
@@ -238,22 +319,39 @@ export class BtcWallet {
   async send(to, sats, { feeRate } = {}) {
     const { btc } = await loadLibs()
     sats = Math.floor(Number(sats))
-    if (!Number.isFinite(sats) || sats < 294) throw new Error('amount below dust limit (294 sats)')
+    const params = this.netParams
+    const minOut = dustThreshold(btc, to, params)
+    if (!Number.isFinite(sats) || sats < minOut) {
+      throw new Error(`amount below the dust limit for that address (${minOut} sats)`)
+    }
     const rate = feeRate ?? await this.feeRate()
-    const utxos = (await this.utxos()).sort((a, b) => b.value - a.value)
-    if (!utxos.length) throw new Error('wallet is empty — hit a faucet first')
+    const { spendable, immature } = await this.spendableUtxos()
+    const utxos = spendable.sort((a, b) => b.value - a.value)
+    if (!utxos.length) {
+      throw new Error(immature
+        ? `${immature.toLocaleString()} sats are freshly mined and need ${COINBASE_MATURITY} confirmations before they can be spent`
+        : 'wallet is empty — hit a faucet first')
+    }
 
+    // Size every output by its real scriptPubKey. Taproot outputs are 43 vB;
+    // assuming 31 (P2WPKH) here underpaid a taproot-to-taproot tip by ~24 vB,
+    // which at a 1 sat/vB floor lands under min relay fee and is rejected (-26).
     const inVb = this.taproot ? 57.5 : 68
-    const vsize = (ins, outs) => Math.ceil(10.5 + inVb * ins + 31 * outs)
+    const toVb = outputVbytes(btc, to, params)
+    const changeVb = outputVbytes(btc, this.address, params)
+    const vsize = (ins, withChange) => Math.ceil(10.5 + inVb * ins + toVb + (withChange ? changeVb : 0))
     const picked = []
     let inSum = 0, fee = 0
     for (const utxo of utxos) {
       picked.push(utxo)
       inSum += utxo.value
-      fee = vsize(picked.length, 2) * rate
+      fee = vsize(picked.length, true) * rate
       if (inSum >= sats + fee) break
     }
-    if (inSum < sats + fee) throw new Error(`insufficient funds: have ${inSum}, need ${sats + fee} (incl ~${fee} fee)`)
+    if (inSum < sats + fee) {
+      const short = `insufficient funds: have ${inSum.toLocaleString()}, need ${(sats + fee).toLocaleString()} (incl ~${fee} fee)`
+      throw new Error(immature ? `${short}; another ${immature.toLocaleString()} sats are still maturing` : short)
+    }
 
     const tx = new btc.Transaction()
     for (const utxo of picked) {
@@ -264,15 +362,23 @@ export class BtcWallet {
       if (this.taproot) input.tapInternalKey = hexToBytes(this.scope)
       tx.addInput(input)
     }
-    tx.addOutputAddress(to, BigInt(sats), this.netParams)
+    tx.addOutputAddress(to, BigInt(sats), params)
+    // Change below its own dust threshold can't be created — it goes to the miner.
     const change = inSum - sats - fee
-    if (change >= 294) tx.addOutputAddress(this.address, BigInt(change), this.netParams)
+    if (change >= dustThreshold(btc, this.address, params)) {
+      tx.addOutputAddress(this.address, BigInt(change), params)
+    }
     tx.sign(this._priv)
     tx.finalize()
 
-    const res = await this._api('/tx', { method: 'POST', body: tx.hex })
+    let res
+    try {
+      res = await this._api('/tx', { method: 'POST', body: tx.hex })
+    } catch (err) {
+      throw new Error(explainBroadcastError(err.message || err))
+    }
     const txid = (await res.text()).trim()
-    if (!/^[0-9a-f]{64}$/.test(txid)) throw new Error('broadcast failed: ' + txid.slice(0, 120))
+    if (!/^[0-9a-f]{64}$/.test(txid)) throw new Error(explainBroadcastError(txid))
     return { txid, fee: Number(tx.fee) }
   }
 
@@ -543,8 +649,9 @@ class NostrWallet extends HTMLElement {
   async _refresh() {
     try {
       const wallet = this.wallet
-      const [{ total, mempool }, price, history] = await Promise.all([
+      const [{ total, mempool }, price, history, spend] = await Promise.all([
         wallet.balance(), btcUsd(), wallet.history(6),
+        wallet.spendableUtxos().catch(() => ({ immature: 0 })),
       ])
       if (this.wallet !== wallet) return // a re-boot overtook us
 
@@ -557,6 +664,8 @@ class NostrWallet extends HTMLElement {
       }
       if (usd !== null && total > 0) bits.push('\u2248 $' + usd.toFixed(usd < 10 ? 2 : 0) + (wallet.networkName === 'mainnet' ? '' : ' at mainnet price'))
       if (mempool) bits.push(`${mempool > 0 ? '+' : ''}${mempool} unconfirmed`)
+      // freshly mined coins show up in the balance long before they can move
+      if (spend.immature > 0) bits.push(`${spend.immature.toLocaleString()} still maturing`)
       const small = document.createElement('small')
       small.textContent = bits.length ? ' (' + bits.join(' \u00b7 ') + ')' : ''
 
