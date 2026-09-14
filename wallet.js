@@ -57,6 +57,7 @@ export const NETWORKS = {
     unit: 'tsat', coin: 'tBTC',
     profileField: 'btc_test',
     faucets: [
+      { url: 'https://faucet.activetk.jp/', name: 'faucet.activetk.jp' },
       { url: 'https://coinfaucet.eu/en/btc-testnet4/', name: 'coinfaucet.eu' },
       { url: 'https://faucet.testnet4.dev/', name: 'faucet.testnet4.dev' },
     ],
@@ -438,6 +439,21 @@ export function ago(unixSeconds) {
 
 export const formatSats = (sats) =>
   sats >= 100_000_000 ? (sats / 100_000_000).toFixed(4) + ' BTC' : sats.toLocaleString() + ' sats'
+
+/**
+ * A balance at a glance, for somewhere with no room for the real number —
+ * a nav item, a chip. 840 / 1.2k / 12M / 1.23 ₿. Deliberately rough: the
+ * exact figure lives on the wallet card.
+ */
+export function formatSatsShort(sats) {
+  const n = Math.max(0, Math.floor(Number(sats) || 0))
+  const trim = (v, digits) => String(Number(v.toFixed(digits)))
+  if (n >= 100_000_000) return trim(n / 100_000_000, 2) + '\u20bf'
+  if (n >= 1_000_000) return trim(n / 1_000_000, 1) + 'M'
+  if (n >= 100_000) return trim(n / 1_000, 0) + 'k'   // 209k, not 209.4k
+  if (n >= 1_000) return trim(n / 1_000, 1) + 'k'
+  return String(n)
+}
 
 // ------------------------------------------------------------ <nostr-wallet>
 
